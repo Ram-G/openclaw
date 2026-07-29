@@ -106,7 +106,9 @@ function resolveEnvelopeTimezone(options: NormalizedEnvelopeOptions): ResolvedEn
     return { mode: "iana", timeZone: resolveUserTimezone(options.userTimezone) };
   }
   const explicit = resolveTimezone(trimmed);
-  return explicit ? { mode: "iana", timeZone: explicit } : { mode: "utc" };
+  // Prompt and system-event paths fall back to host time for invalid user zones;
+  // keep message envelopes on the same reference clock.
+  return explicit ? { mode: "iana", timeZone: explicit } : { mode: "local" };
 }
 
 /** Formats an envelope timestamp using local, UTC, user, or explicit IANA timezone rules. */
