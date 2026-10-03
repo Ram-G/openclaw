@@ -127,6 +127,7 @@ export function useNodeBootstrapArtifactFixtures() {
     await write(packageRoot, "gateway-run-argv.mjs", "export {};");
     await write(packageRoot, "gateway-shutdown-budget.mjs", "export {};");
     await write(packageRoot, "node-host-launcher.mjs", "export const launcher = true;");
+    await write(packageRoot, "node-compile-cache.mjs", "export {};");
     await write(packageRoot, "scripts/preinstall.mjs", "export {};\n");
     await write(
       packageRoot,
@@ -146,6 +147,7 @@ export function useNodeBootstrapArtifactFixtures() {
     await write(packageRoot, "dist/worker/worker.mjs", 'console.log("separate-worker-bundle");');
     await write(packageRoot, "dist/worker/workspace-rsync-receiver.mjs", "export {};");
     await write(packageRoot, "dist/worker/github-exec-launcher.mjs", "export {};");
+    await write(packageRoot, "dist/worker-artifacts/fixture.tgz", "separate-worker-archive");
     await write(packageRoot, "dist/build-info.json", { version, buildId });
     await write(packageRoot, "dist/extensions/remote-runtime/package.json", pluginPackage);
     await write(packageRoot, "dist/extensions/remote-runtime/openclaw.plugin.json", {

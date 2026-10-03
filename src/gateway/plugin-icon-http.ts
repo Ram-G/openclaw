@@ -7,7 +7,8 @@ import pLimit from "p-limit";
 import { startsWithSvgRootElement } from "../../packages/gateway-protocol/src/svg-image.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { openRootFile, readFileDescriptorBounded } from "../infra/boundary-file-read.js";
-import { pruneMapToMaxSize } from "../infra/map-size.js";
+import { fetchClawHubPluginIconUrls } from "../infra/clawhub-plugin-icons.js";
+import { LruCache } from "../infra/lru-cache.js";
 import { normalizeHostname } from "../infra/net/hostname.js";
 import { isBlockedHostnameOrIp } from "../infra/net/ssrf.js";
 import { readRemoteMediaBuffer } from "../media/fetch.js";
@@ -18,7 +19,7 @@ import {
 } from "../media/image-ops.js";
 import { resolveClawHubCatalogIconUrl } from "../plugins/catalog-icon-registry.js";
 import {
-  resolveManagedPluginIconSource,
+  resolveManagedPluginIconSources,
   resolveManagedPluginActivityIconSource,
   resolveManagedSetupCatalogIconUrl,
 } from "../plugins/management-service.js";
@@ -57,7 +58,7 @@ type PluginIconCacheEntry = {
   promise: Promise<HttpImageRepresentation | null>;
 };
 
-let pluginIconCache = new Map<string, PluginIconCacheEntry>();
+let pluginIconCache = new LruCache<PluginIconCacheEntry>(PLUGIN_ICON_CACHE_MAX_ENTRIES);
 const pluginIconImageProcessor = createImageProcessor();
 
 function normalizeLinkFaviconHostname(value: string): string | null {
@@ -88,14 +89,32 @@ async function validateImageMime(body: Buffer, contentType: string): Promise<boo
 }
 
 function rememberIcon(
-  cache: Map<string, PluginIconCacheEntry>,
   cacheKey: string,
-  entry: PluginIconCacheEntry,
-): PluginIconCacheEntry {
-  cache.delete(cacheKey);
-  cache.set(cacheKey, entry);
-  pruneMapToMaxSize(cache, PLUGIN_ICON_CACHE_MAX_ENTRIES);
-  return entry;
+  promise: PluginIconCacheEntry["promise"],
+  expiresAt: number,
+  retainFailureForMs?: number,
+): PluginIconCacheEntry["promise"] {
+  const entry = { expiresAt, promise };
+  pluginIconCache.set(cacheKey, entry);
+  return promise.then((result) => {
+    if (!result && pluginIconCache.peek(cacheKey) === entry) {
+      if (retainFailureForMs) {
+        entry.expiresAt = Date.now() + retainFailureForMs;
+      } else {
+        pluginIconCache.delete(cacheKey);
+      }
+    }
+    return result;
+  });
+}
+
+function readCachedIcon(cacheKey: string, now: number): PluginIconCacheEntry | undefined {
+  const cached = pluginIconCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached;
+  }
+  pluginIconCache.delete(cacheKey);
+  return undefined;
 }
 
 async function normalizeIconPayload(params: {
@@ -144,14 +163,9 @@ async function loadPackageIcon(params: {
 }): Promise<HttpImageRepresentation | null> {
   const cacheKey = `${params.cacheScope}\0file:${params.rootPath}\0${params.iconPath}`;
   const now = Date.now();
-  const cached = pluginIconCache.get(cacheKey);
-  if (cached && cached.expiresAt > now) {
-    pluginIconCache.delete(cacheKey);
-    pluginIconCache.set(cacheKey, cached);
-    return await cached.promise;
-  }
+  const cached = readCachedIcon(cacheKey, now);
   if (cached) {
-    pluginIconCache.delete(cacheKey);
+    return await cached.promise;
   }
 
   const pending = (async () => {
@@ -184,15 +198,7 @@ async function loadPackageIcon(params: {
       closeSync(opened.fd);
     }
   })();
-  const entry = rememberIcon(pluginIconCache, cacheKey, {
-    expiresAt: now + PLUGIN_ICON_CACHE_TTL_MS,
-    promise: pending,
-  });
-  const result = await pending;
-  if (!result && pluginIconCache.get(cacheKey) === entry) {
-    pluginIconCache.delete(cacheKey);
-  }
-  return result;
+  return await rememberIcon(cacheKey, pending, now + PLUGIN_ICON_CACHE_TTL_MS);
 }
 
 async function loadCatalogIcon(params: {
@@ -221,14 +227,9 @@ async function loadCatalogIcon(params: {
 
   const cacheKey = `${params.cacheScope}\0${parsed.href}`;
   const now = Date.now();
-  const cached = pluginIconCache.get(cacheKey);
-  if (cached && cached.expiresAt > now) {
-    pluginIconCache.delete(cacheKey);
-    pluginIconCache.set(cacheKey, cached);
-    return await cached.promise;
-  }
+  const cached = readCachedIcon(cacheKey, now);
   if (cached) {
-    pluginIconCache.delete(cacheKey);
+    return await cached.promise;
   }
 
   const load = async () => {
@@ -266,23 +267,60 @@ async function loadCatalogIcon(params: {
     return null;
   }
   const pending = params.limitConcurrency ? linkFaviconFetchLimit(load) : load();
-  const entry = rememberIcon(pluginIconCache, cacheKey, {
-    expiresAt: now + PLUGIN_ICON_CACHE_TTL_MS,
-    promise: pending,
-  });
-  const result = await pending;
-  if (!result && pluginIconCache.get(cacheKey) === entry) {
-    if (params.retainFailureForMs) {
-      entry.expiresAt = Date.now() + params.retainFailureForMs;
-    } else {
-      pluginIconCache.delete(cacheKey);
-    }
-  }
-  return result;
+  return await rememberIcon(
+    cacheKey,
+    pending,
+    now + PLUGIN_ICON_CACHE_TTL_MS,
+    params.retainFailureForMs,
+  );
 }
 
 export function clearPluginIconCacheForTest(): void {
-  pluginIconCache = new Map();
+  pluginIconCache = new LruCache(PLUGIN_ICON_CACHE_MAX_ENTRIES);
+}
+
+async function loadPluginIcon(
+  cacheScope: string,
+  sources: Awaited<ReturnType<typeof resolveManagedPluginIconSources>>,
+): Promise<HttpImageRepresentation | null> {
+  const cacheKey = `${cacheScope}\0sources:${JSON.stringify(sources)}`;
+  const cached = pluginIconCache.peek(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return await cached.promise;
+  }
+  const pending = (async () => {
+    for (const source of sources) {
+      if (source.kind === "file") {
+        const icon = await loadPackageIcon({
+          cacheScope,
+          iconPath: source.path,
+          rootPath: source.rootPath,
+        });
+        if (icon) {
+          return icon;
+        }
+      } else {
+        try {
+          const urls = await fetchClawHubPluginIconUrls({
+            ...source,
+            skipAuth: true,
+            timeoutMs: PLUGIN_ICON_REQUEST_TIMEOUT_MS,
+          });
+          for (const iconUrl of urls) {
+            const icon = await loadCatalogIcon({ cacheScope, iconUrl });
+            if (icon) {
+              return icon;
+            }
+          }
+        } catch {
+          // Optional remote branding must not prevent the caller's initials fallback.
+        }
+      }
+    }
+    return null;
+  })();
+  // Cache the completed chain so a rejected package image cannot hide its publisher image.
+  return await rememberIcon(cacheKey, pending, Date.now() + PLUGIN_ICON_CACHE_TTL_MS);
 }
 
 export async function handlePluginIconHttpRequest(
@@ -355,7 +393,7 @@ export async function handlePluginIconHttpRequest(
   const pluginIcon = pluginId
     ? activityRequest.matched
       ? await resolveManagedPluginActivityIconSource({ config: opts.config, pluginId, toolName })
-      : await resolveManagedPluginIconSource({
+      : await resolveManagedPluginIconSources({
           config: opts.config,
           pluginId,
         })
@@ -380,25 +418,27 @@ export async function handlePluginIconHttpRequest(
     : faviconHostname
       ? "favicon"
       : "catalog";
-  const icon = pluginIcon
-    ? await loadPackageIcon({
-        cacheScope,
-        iconPath: pluginIcon.path,
-        rootPath: pluginIcon.rootPath,
-        activity: activityRequest.matched,
-      })
-    : await loadCatalogIcon({
-        cacheScope,
-        iconUrl: remoteIconUrl!,
-        ...(faviconHostname
-          ? {
-              maxBytes: LINK_FAVICON_MAX_BYTES,
-              requireHttps: true,
-              retainFailureForMs: LINK_FAVICON_NEGATIVE_CACHE_TTL_MS,
-              limitConcurrency: true,
-            }
-          : {}),
-      });
+  const icon = Array.isArray(pluginIcon)
+    ? await loadPluginIcon(cacheScope, pluginIcon)
+    : pluginIcon
+      ? await loadPackageIcon({
+          cacheScope,
+          iconPath: pluginIcon.path,
+          rootPath: pluginIcon.rootPath,
+          activity: activityRequest.matched,
+        })
+      : await loadCatalogIcon({
+          cacheScope,
+          iconUrl: remoteIconUrl!,
+          ...(faviconHostname
+            ? {
+                maxBytes: LINK_FAVICON_MAX_BYTES,
+                requireHttps: true,
+                retainFailureForMs: LINK_FAVICON_NEGATIVE_CACHE_TTL_MS,
+                limitConcurrency: true,
+              }
+            : {}),
+        });
   requestAuth.assertCurrent();
   if (!icon) {
     sendNotFound(res);

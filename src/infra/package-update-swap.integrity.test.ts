@@ -3,11 +3,16 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { withTestDir } from "../test-helpers/temp-dir.js";
-import { swapStagedPackageInstall, type PackageUpdateTransaction } from "./package-update-swap.js";
+import { interceptPackageFileHashes } from "./package-update-integrity-hasher.test-support.js";
+import { PackageIntegrityTimeoutError } from "./package-update-integrity.js";
+import type { PackageUpdateTransaction } from "./package-update-swap-contract.js";
+import { swapStagedPackageInstall } from "./package-update-swap.js";
 import {
   createPackageSwapFixture,
   createRetainedPackageSwap,
 } from "./package-update-swap.test-support.js";
+import { prepareUpdateFailureReport } from "./update-failure-report-prepare.js";
+import { updateRunStepsFromResultStep } from "./update-run-step.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -922,15 +927,19 @@ describe("retained npm package integrity", () => {
   });
 
   it.each([
-    "external link",
-    "sibling dependency link",
-    "oversized file",
-    "unavailable inode",
+    { shape: "external link", cause: "Package rollback symlink leaves the retained tree" },
+    {
+      shape: "sibling dependency link",
+      cause: "Package rollback symlink leaves the retained tree",
+    },
+    { shape: "unavailable inode", cause: "Package rollback filesystem identity is unavailable" },
+    { shape: "timed-out scan", cause: "Package rollback verification timed out" },
   ] as const)(
-    "refuses an unverifiable %s before service preparation or live mutation",
-    async (shape) => {
+    "records the baseline scan failure for $shape before service preparation or live mutation",
+    async ({ shape, cause }) => {
       await withTestDir({ prefix: "openclaw-rollback-admission-" }, async (base) => {
         const { params, packageRoot, globalRoot, launcher } = await createPackageSwapFixture(base);
+        let timedOut = false;
         if (shape === "external link") {
           await fs.symlink(base, path.join(packageRoot, "external"));
         }
@@ -943,11 +952,6 @@ describe("retained npm package integrity", () => {
           await fs.symlink("../../fixture-dependency", link);
           expect(await fs.realpath(link)).toBe(await fs.realpath(dependency));
         }
-        if (shape === "oversized file") {
-          const file = path.join(packageRoot, "oversized.bin");
-          await fs.writeFile(file, "");
-          await fs.truncate(file, 1024 * 1024 * 1024 + 1);
-        }
         if (shape === "unavailable inode") {
           const lstat = fs.lstat.bind(fs);
           vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
@@ -958,6 +962,19 @@ describe("retained npm package integrity", () => {
             return stat;
           });
         }
+        if (shape === "timed-out scan") {
+          const lstat = fs.lstat.bind(fs);
+          vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
+            if (timedOut && String(args[0]) === packageRoot) {
+              throw new Error("identity fallback unavailable");
+            }
+            return lstat(...args);
+          });
+          interceptPackageFileHashes(async () => {
+            timedOut = true;
+            throw new PackageIntegrityTimeoutError(40);
+          });
+        }
         const beforeActivate = vi.fn();
         const onLiveMutation = vi.fn();
         const result = await swapStagedPackageInstall({
@@ -965,9 +982,33 @@ describe("retained npm package integrity", () => {
           beforeActivate,
           onLiveMutation,
         });
+        expect(timedOut).toBe(shape === "timed-out scan");
         expect(result.status).toBe("failed");
         expect(result.step.stderrTail).not.toContain("package tree changed");
         expect(result.step.stderrTail).not.toContain("Installation recovery is unverified");
+        const steps = updateRunStepsFromResultStep(result.step);
+        expect(steps[0]).toMatchObject({
+          detail: expect.stringContaining("Baseline package scan failed"),
+          failureFacts: [
+            {
+              check: "package-swap",
+              code: "baseline-scan-failed",
+              message: expect.stringContaining(cause),
+            },
+          ],
+        });
+        const report = await prepareUpdateFailureReport(
+          {
+            attemptId: "baseline-failure",
+            result: { mode: "npm", status: "error", steps: [], durationMs: 0 },
+            recordedRun: { runId: "baseline-failure", steps },
+          },
+          { env: {}, stateDir: base },
+        );
+        expect(report.body).toContain("baseline-scan-failed");
+        expect(report.body).toContain(cause);
+        expect(report.body).not.toContain("identity fallback unavailable");
+        expect(report.body).not.toContain(base);
         expect(result).toMatchObject({ packageRollbackVerified: false });
         expect(beforeActivate).not.toHaveBeenCalled();
         expect(onLiveMutation).not.toHaveBeenCalled();
